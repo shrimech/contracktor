@@ -160,15 +160,49 @@ class TruckDriveDB {
     }
 
     async delete(tableName, id) {
-        if (this.useLocalStorage) {
-            return this.deleteLS(tableName, id);
+        if (tableName === 'users') {
+            // Also delete all users with the same email (to avoid unique index issues)
+            const user = await this.read('users', id);
+            if (user && user.email) {
+                const usersWithEmail = await this.query('users', { email: user.email });
+                for (const u of usersWithEmail) {
+                    await this._deleteUserById(u.id);
+                }
+                return true;
+            }
         }
+        return this._deleteUserById ? this._deleteUserById(id) : this._genericDelete(tableName, id);
+    }
 
+    async _deleteUserById(id) {
+        // Mark user as deleted (soft delete) and remove from DB
+        if (this.useLocalStorage) {
+            // Remove from localStorage
+            const items = JSON.parse(localStorage.getItem('users') || '[]');
+            const filtered = items.filter(item => item.id !== id);
+            localStorage.setItem('users', JSON.stringify(filtered));
+            return true;
+        }
+        return new Promise((resolve, reject) => {
+            const transaction = this.db.transaction(['users'], 'readwrite');
+            const store = transaction.objectStore('users');
+            const request = store.delete(id);
+            request.onsuccess = () => resolve(true);
+            request.onerror = () => reject(request.error);
+        });
+    }
+
+    _genericDelete(tableName, id) {
+        if (this.useLocalStorage) {
+            const items = JSON.parse(localStorage.getItem(tableName) || '[]');
+            const filtered = items.filter(item => item.id !== id);
+            localStorage.setItem(tableName, JSON.stringify(filtered));
+            return Promise.resolve(true);
+        }
         return new Promise((resolve, reject) => {
             const transaction = this.db.transaction([tableName], 'readwrite');
             const store = transaction.objectStore(tableName);
             const request = store.delete(id);
-
             request.onsuccess = () => resolve(true);
             request.onerror = () => reject(request.error);
         });
@@ -276,12 +310,18 @@ class TruckDriveDB {
     async createUser(userData) {
         userData.createdAt = new Date().toISOString();
         userData.isActive = true;
+        // Check for existing *active* user with same email
+        const users = await this.query('users', { email: userData.email });
+        if (users.some(u => u.isActive !== false)) {
+            throw new Error('User with this email already exists');
+        }
         return await this.create('users', userData);
     }
 
     async getUserByEmail(email) {
+        // Only return active user (not deleted)
         const users = await this.query('users', { email });
-        return users[0] || null;
+        return users.find(u => u.isActive !== false) || null;
     }
 
     async authenticateUser(email, password) {
@@ -320,15 +360,40 @@ class TruckDriveDB {
     async acceptDeliveryRequest(requestId, driverId) {
         const request = await this.read('deliveryRequests', requestId);
         if (request && request.status === 'pending') {
-            request.status = 'accepted';
+            request.status = 'assigned';
             request.assignedDriverId = driverId;
             request.acceptedAt = new Date().toISOString();
             request.updatedAt = new Date().toISOString();
-            
-            // Update driver availability
+
+            // Block all other drivers from seeing this request
+            const allDrivers = await this.read('drivers');
+            request.declinedDrivers = allDrivers
+                .filter(d => d.id !== driverId)
+                .map(d => d.id);
+
+            // Update driver availability: block this driver from seeing other requests
             await this.setDriverAvailability(driverId, false);
-            
-            return await this.update('deliveryRequests', request);
+
+            await this.update('deliveryRequests', request);
+
+            // Create delivery record
+            await this.createDelivery({
+                requestId: request.id,
+                driverId: driverId,
+                customerId: request.customerId,
+                finalPrice: request.proposedPrice,
+                status: 'assigned'
+            });
+
+            // Create contact record for communication
+            await this.createContact({
+                requestId: request.id,
+                customerId: request.customerId,
+                driverId: driverId,
+                status: 'active'
+            });
+
+            return request;
         }
         return null;
     }
@@ -380,7 +445,14 @@ class TruckDriveDB {
     }
 
     async updateDriverLocation(driverId, location, city) {
-        const driver = await this.read('drivers', driverId);
+        // Fix: Accept both numeric and string IDs, and ensure update works for both IndexedDB and localStorage
+        if (!driverId) return null;
+        let driver = await this.read('drivers', driverId);
+        // If not found by id, try to find by userId (for legacy/incorrect calls)
+        if (!driver) {
+            const drivers = await this.query('drivers', { userId: driverId });
+            driver = drivers[0];
+        }
         if (driver) {
             driver.currentLocation = location;
             driver.currentCity = city;
@@ -391,7 +463,9 @@ class TruckDriveDB {
     }
 
     async getDriversByCity(city) {
-        return await this.query('drivers', { currentCity: city, isAvailable: true });
+        const drivers = await this.query('drivers', { currentCity: city });
+        // Only return drivers who are available and updated location in last 24h
+        return drivers.filter(driver => this.isDriverActive(driver));
     }
 
     async getDriverByUserId(userId) {
@@ -400,11 +474,12 @@ class TruckDriveDB {
     }
 
     async getAvailableDrivers(truckType = null) {
-        const filters = { isAvailable: true };
+        let drivers = await this.query('drivers', {});
+        drivers = drivers.filter(driver => this.isDriverActive(driver));
         if (truckType) {
-            filters.truckType = truckType;
+            drivers = drivers.filter(driver => driver.truckType === truckType);
         }
-        return await this.query('drivers', filters);
+        return drivers;
     }
 
     async setDriverAvailability(driverId, isAvailable) {
@@ -421,23 +496,34 @@ class TruckDriveDB {
     async createBid(bidData) {
         bidData.createdAt = new Date().toISOString();
         bidData.status = 'pending';
-        bidData.message = bidData.message || ''; // Optional message from driver
-        
+        bidData.message = bidData.message || '';
+
         // Get driver and customer info for notifications
         const driver = await this.read('drivers', bidData.driverId);
         const driverUser = await this.read('users', driver.userId);
         const request = await this.read('deliveryRequests', bidData.requestId);
-        
+
         bidData.driverName = driverUser.name;
         bidData.driverPhone = driverUser.phone;
         bidData.truckType = driver.truckType;
         bidData.truckModel = driver.truckModel;
         bidData.driverRating = driver.rating;
-        
+
         // Update bid count on request
         if (request) {
             request.bidCount = (request.bidCount || 0) + 1;
             await this.update('deliveryRequests', request);
+        }
+
+        // Create contact record for communication if not already exists
+        const contacts = await this.query('contacts', { requestId: bidData.requestId, driverId: bidData.driverId });
+        if (contacts.length === 0) {
+            await this.createContact({
+                requestId: bidData.requestId,
+                customerId: bidData.customerId,
+                driverId: bidData.driverId,
+                status: 'pending'
+            });
         }
 
         return await this.create('bids', bidData);
@@ -560,18 +646,21 @@ class TruckDriveDB {
         if (delivery) {
             delivery.status = status;
             delivery.updatedAt = new Date().toISOString();
-            
+
             if (status === 'completed') {
                 delivery.completedAt = new Date().toISOString();
-                
+
                 // Update driver stats
                 const driver = await this.read('drivers', delivery.driverId);
                 if (driver) {
                     driver.totalDeliveries = (driver.totalDeliveries || 0) + 1;
                     await this.update('drivers', driver);
+
+                    // Set driver available again
+                    await this.setDriverAvailability(driver.id, true);
                 }
             }
-            
+
             return await this.update('deliveries', delivery);
         }
         return null;
@@ -909,6 +998,16 @@ class TruckDriveDB {
         }
         
         return info;
+    }
+
+    // Utility: Check if driver is active (available and location updated in last 24h)
+    isDriverActive(driver) {
+        if (!driver || !driver.isAvailable) return false;
+        if (!driver.lastLocationUpdate) return false;
+        const lastUpdate = new Date(driver.lastLocationUpdate);
+        const now = new Date();
+        const diffHours = (now - lastUpdate) / (1000 * 60 * 60);
+        return diffHours <= 24;
     }
 }
 
