@@ -1287,12 +1287,68 @@ document.addEventListener('DOMContentLoaded', function() {
 });
 
 // Sample function to demonstrate bid management
-function showCustomerBids() {
-    alert('Showing customer bids (feature in development)');
+async function showCustomerBids() {
+    if (!currentUser || currentUser.type !== 'customer') {
+        showErrorMessage('Please login as a customer to view your bids.');
+        showLoginModal();
+        return;
+    }
+    try {
+        // Use the database helper to get all bids for this customer (recommended for performance)
+        const allBids = await window.truckDB.getBidsForCustomer(currentUser.id);
+        if (!allBids.length) {
+            showSuccessMessage('No bids yet for your requests.');
+            return;
+        }
+
+        // Build HTML for modal
+        let html = `<h3 style="margin-bottom:1rem;">Bids for Your Requests</h3>`;
+        for (const bid of allBids) {
+            // Get driver info
+            let driver = null, driverUser = null;
+            if (bid.driverId) {
+                driver = await window.truckDB.read('drivers', bid.driverId);
+                if (driver && driver.userId) {
+                    driverUser = await window.truckDB.read('users', driver.userId);
+                }
+            }
+            const request = bid.requestInfo || {};
+            html += `
+                <div style="border:1px solid #eee; border-radius:8px; padding:12px; margin-bottom:12px; background:#fafbfc;">
+                    <div><strong>Request #${request.id || ''}:</strong> ${request.pickupLocation || request.pickup || ''} → ${request.deliveryLocation || request.delivery || ''}</div>
+                    <div><strong>Bid Amount:</strong> $${bid.bidAmount}</div>
+                    <div><strong>Status:</strong> <span class="status-badge status-${bid.status}">${bid.status}</span></div>
+                    <div><strong>Driver:</strong> ${driverUser ? driverUser.name : 'Unknown'} ${driverUser && driverUser.phone ? '(' + driverUser.phone + ')' : ''}</div>
+                    <div><strong>Truck:</strong> ${driver ? getTruckTypeLabel(driver.truckType) : ''} ${driver && driver.truckModel ? '(' + driver.truckModel + ')' : ''}</div>
+                    <div><strong>Driver Rating:</strong> ${driver && driver.rating ? driver.rating : 'N/A'} ⭐</div>
+                </div>
+            `;
+        }
+        // Show in modal
+        showSimpleModal('Your Bids', html);
+    } catch (error) {
+        console.error('Error loading customer bids:', error);
+        showErrorMessage('Error loading your bids.');
+    }
 }
 
-function showCustomerContacts() {
-    alert('Showing customer contacts/messages (feature in development)');
+// Utility: show a simple modal with content
+function showSimpleModal(title, html) {
+    // Remove any existing modal
+    const existing = document.getElementById('simple-modal');
+    if (existing) existing.remove();
+    const modal = document.createElement('div');
+    modal.id = 'simple-modal';
+    modal.className = 'modal';
+    modal.style.display = 'block';
+    modal.innerHTML = `
+        <div class="modal-content" style="max-width:600px;">
+            <span class="close" onclick="document.getElementById('simple-modal').remove()">&times;</span>
+            <h2>${title}</h2>
+            <div style="max-height:400px;overflow-y:auto;">${html}</div>
+        </div>
+    `;
+    document.body.appendChild(modal);
 }
 
 // Utility Functions
@@ -1872,4 +1928,46 @@ function showRemoteSettings() {
 // Sample function to demonstrate local settings
 function showLocalSettings() {
     alert('Local Settings (feature in development)');
+}
+
+// Add this function to handle the Update Location button for drivers
+async function updateDriverLocation() {
+    if (!currentUser || currentUser.type !== 'driver') {
+        showErrorMessage('Please login as a driver to update your location.');
+        showLoginModal();
+        return;
+    }
+    const locationInput = document.getElementById('driver-current-location');
+    const cityInput = document.getElementById('driver-current-city');
+    // If city input does not exist, fallback to location as city
+    let location = locationInput ? locationInput.value.trim() : '';
+    let city = '';
+    if (cityInput) {
+        city = cityInput.value.trim();
+    } else if (location) {
+        // Try to extract city from location (comma separated)
+        const parts = location.split(',');
+        city = parts.length > 1 ? parts[parts.length - 1].trim() : location;
+    }
+    if (!location || !city) {
+        showErrorMessage('Please enter your current location and city.');
+        return;
+    }
+    try {
+        let driver = await window.truckDB.getDriverByUserId(currentUser.id);
+        if (!driver) {
+            showErrorMessage('Driver profile not found. Please complete your driver setup.');
+            showDriverSetupModal();
+            return;
+        }
+        driver.currentLocation = location;
+        driver.currentCity = city;
+        driver.lastLocationUpdate = new Date().toISOString();
+        await window.truckDB.update('drivers', driver);
+        showSuccessMessage('Location updated! You will now see requests in your area.');
+        updateDriverRequests();
+    } catch (error) {
+        console.error('Error updating driver location:', error);
+        showErrorMessage('Failed to update location. Please try again.');
+    }
 }

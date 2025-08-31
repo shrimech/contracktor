@@ -500,30 +500,37 @@ class TruckDriveDB {
 
         // Get driver and customer info for notifications
         const driver = await this.read('drivers', bidData.driverId);
-        const driverUser = await this.read('users', driver.userId);
+        const driverUser = driver ? await this.read('users', driver.userId) : null;
         const request = await this.read('deliveryRequests', bidData.requestId);
 
-        bidData.driverName = driverUser.name;
-        bidData.driverPhone = driverUser.phone;
-        bidData.truckType = driver.truckType;
-        bidData.truckModel = driver.truckModel;
-        bidData.driverRating = driver.rating;
-
-        // Update bid count on request
+        // --- Ensure bid has driver name and correct customerId ---
+        if (driverUser) {
+            bidData.driverName = driverUser.name;
+            bidData.driverPhone = driverUser.phone;
+        }
+        if (driver) {
+            bidData.truckType = driver.truckType;
+            bidData.truckModel = driver.truckModel;
+            bidData.driverRating = driver.rating;
+        }
         if (request) {
+            bidData.customerId = request.customerId; // Always set customerId from request
+            // Update bid count on request
             request.bidCount = (request.bidCount || 0) + 1;
             await this.update('deliveryRequests', request);
         }
 
         // Create contact record for communication if not already exists
-        const contacts = await this.query('contacts', { requestId: bidData.requestId, driverId: bidData.driverId });
-        if (contacts.length === 0) {
-            await this.createContact({
-                requestId: bidData.requestId,
-                customerId: bidData.customerId,
-                driverId: bidData.driverId,
-                status: 'pending'
-            });
+        if (bidData.requestId && bidData.driverId && bidData.customerId) {
+            const contacts = await this.query('contacts', { requestId: bidData.requestId, driverId: bidData.driverId });
+            if (contacts.length === 0) {
+                await this.createContact({
+                    requestId: bidData.requestId,
+                    customerId: bidData.customerId,
+                    driverId: bidData.driverId,
+                    status: 'pending'
+                });
+            }
         }
 
         return await this.create('bids', bidData);
@@ -538,19 +545,17 @@ class TruckDriveDB {
     }
 
     async getBidsForCustomer(customerId) {
-        // Get all requests by customer, then get bids for those requests
+        // Get all requests by this customer, then all bids for those requests
         const customerRequests = await this.query('deliveryRequests', { customerId });
         const allBids = [];
-        
         for (const request of customerRequests) {
             const requestBids = await this.query('bids', { requestId: request.id });
-            // Add request info to each bid
+            // Attach request info to each bid for display
             requestBids.forEach(bid => {
                 bid.requestInfo = request;
             });
             allBids.push(...requestBids);
         }
-        
         return allBids;
     }
 
